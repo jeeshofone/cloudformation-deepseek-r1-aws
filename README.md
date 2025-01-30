@@ -20,6 +20,7 @@ This project provides an automated deployment solution for importing DeepSeek's 
   - Lambda functions
   - Bedrock model imports
 - Access to Amazon Bedrock service
+- Python 3.9 or higher
 
 ## Installation
 
@@ -31,13 +32,13 @@ cd cloudformation-deepseek-r1-aws
 
 2. (Optional) Create a Python virtual environment:
 ```bash
-python -m venv venv
+python3 -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
 ```
 
 3. Install dependencies:
 ```bash
-pip install boto3 botocore
+pip install -r requirements.txt
 ```
 
 ## Usage
