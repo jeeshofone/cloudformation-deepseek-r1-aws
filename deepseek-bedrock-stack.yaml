@@ -94,57 +94,33 @@ Resources:
           import shutil
           import boto3
           import cfnresponse
-          
+
           def create_deployment_package():
               os.makedirs('/tmp/package', exist_ok=True)
               os.chdir('/tmp/package')
               
+              # Write requirements file
+              requirements = '''
+              transformers
+              huggingface-hub[hf_transfer]
+              boto3
+              cfnresponse
+              '''
               with open('requirements.txt', 'w') as f:
-                  f.write('transformers\nhuggingface-hub[hf_transfer]\nboto3\ncfnresponse\n')
+                  f.write(requirements.strip())
               
+              # Install dependencies
               subprocess.check_call(['pip', 'install', '-r', 'requirements.txt', '--target', '.'])
               
-              with open('model_deployment.py', 'w') as f:
-                  f.write('''import os
+              # Write model deployment code
+              model_code = '''
+import os
 import json
 import boto3
 import cfnresponse
 from transformers import AutoTokenizer
 from huggingface_hub import snapshot_download
 from botocore.config import Config
-
-def generate(messages, temperature=0.3, max_tokens=4096, top_p=0.9, continuation=False, max_retries=10):
-    tokenizer = AutoTokenizer.from_pretrained("deepseek-ai/DeepSeek-R1-Distill-Llama-8B")
-    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=not continuation)
-    
-    client = boto3.client('bedrock-runtime', config=Config(
-        connect_timeout=300,
-        read_timeout=300,
-        retries={'max_attempts': max_retries}
-    ))
-    
-    attempt = 0
-    while attempt < max_retries:
-        try:
-            response = client.invoke_model(
-                modelId=model_id,
-                body=json.dumps({
-                    'prompt': prompt,
-                    'temperature': temperature,
-                    'max_gen_len': max_tokens,
-                    'top_p': top_p
-                }),
-                accept='application/json',
-                contentType='application/json'
-            )
-            result = json.loads(response['body'].read().decode('utf-8'))
-            return result
-        except Exception as e:
-            print(f"Attempt {attempt + 1} failed: {str(e)}")
-            attempt += 1
-            if attempt < max_retries:
-                time.sleep(30)
-    raise Exception("Failed to get response after maximum retries")
 
 def handler(event, context):
     try:
@@ -191,8 +167,11 @@ def handler(event, context):
         cfnresponse.send(event, context, cfnresponse.FAILED, {
             'Error': str(e)
         })
-''')
+'''
+              with open('model_deployment.py', 'w') as f:
+                  f.write(model_code.strip())
               
+              # Create deployment package
               shutil.make_archive('deployment_package', 'zip', '.')
               return '/tmp/package/deployment_package.zip'
           
