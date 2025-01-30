@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 """
 DeepSeek Bedrock Model Deployment Script
-This script deploys the DeepSeek model to AWS Bedrock using CloudFormation
+This script handles CloudFormation stack deployment for the DeepSeek Bedrock model
 """
 
 import boto3
 import argparse
-import time
 import sys
 import json
 from botocore.exceptions import ClientError
-from huggingface_hub import snapshot_download
 
 def deploy_stack(stack_name, template_file, profile_name=None, region='us-west-2'):
     """
@@ -81,59 +79,6 @@ def deploy_stack(stack_name, template_file, profile_name=None, region='us-west-2
                     raise update_error
         else:
             raise e
-
-def deploy_model():
-    # Initialize clients
-    cf = boto3.client('cloudformation', region_name='us-west-2')
-    s3 = boto3.client('s3', region_name='us-west-2')
-
-    # Deploy CloudFormation stack
-    with open('deepseek-bedrock-stack.yaml', 'r') as f:
-        template_body = f.read()
-
-    stack_name = 'deepseek-bedrock-stack'
-    
-    print("Deploying CloudFormation stack...")
-    cf.create_stack(
-        StackName=stack_name,
-        TemplateBody=template_body,
-        Capabilities=['CAPABILITY_IAM']
-    )
-
-    # Wait for stack creation to complete
-    waiter = cf.get_waiter('stack_create_complete')
-    waiter.wait(StackName=stack_name)
-
-    # Get stack outputs
-    response = cf.describe_stacks(StackName=stack_name)
-    outputs = {
-        output['OutputKey']: output['OutputValue'] 
-        for output in response['Stacks'][0]['Outputs']
-    }
-
-    # Download model from HuggingFace
-    print("Downloading model from HuggingFace...")
-    local_dir = "DeepSeek-R1-Distill-Llama-8B"
-    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
-    snapshot_download(
-        repo_id="deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
-        local_dir=local_dir
-    )
-
-    # Upload model to S3
-    print("Uploading model to S3...")
-    bucket_name = outputs['ModelStorageBucketName']
-    for root, dirs, files in os.walk(local_dir):
-        for file in files:
-            local_path = os.path.join(root, file)
-            s3_key = os.path.join(
-                'DeepSeek-R1-Distill-Llama-8B',
-                os.path.relpath(local_path, local_dir)
-            )
-            s3.upload_file(local_path, bucket_name, s3_key)
-
-    print("Deployment complete!")
-    print(f"Model import job ARN: {outputs['ModelImportJobArn']}")
 
 def main():
     parser = argparse.ArgumentParser(description='Deploy DeepSeek model to AWS Bedrock')
