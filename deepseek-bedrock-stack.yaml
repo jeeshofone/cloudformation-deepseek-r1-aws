@@ -42,7 +42,221 @@ Resources:
       VersioningConfiguration:
         Status: Enabled
 
-  # Lambda execution role
+  # Lambda Layer for common dependencies
+  ModelDeploymentLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      CompatibleRuntimes:
+        - python3.9
+      Content:
+        S3Bucket: !Ref ModelStorageBucket
+        S3Key: layers/model-deployment-layer.zip
+      Description: Layer containing dependencies for model deployment
+      LayerName: model-deployment-dependencies
+
+  # Lambda execution role for packager
+  PackagerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ModelStorageBucket.Arn
+                  - !Sub ${ModelStorageBucket.Arn}/*
+
+  # Lambda function to package dependencies
+  DependencyPackager:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt PackagerLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import os
+          import subprocess
+          import shutil
+          import boto3
+          import cfnresponse
+          
+          def create_deployment_package():
+              # Create temp directory
+              os.makedirs('/tmp/package', exist_ok=True)
+              os.chdir('/tmp/package')
+              
+              # Create requirements.txt
+              with open('requirements.txt', 'w') as f:
+                  f.write('\n'.join([
+                      'transformers',
+                      'huggingface-hub[hf_transfer]',
+                      'boto3',
+                      'cfnresponse'
+                  ]))
+              
+              # Install dependencies
+              subprocess.check_call([
+                  'pip', 'install',
+                  '-r', 'requirements.txt',
+                  '--target', '.'
+              ])
+              
+              # Create deployment code
+              with open('model_deployment.py', 'w') as f:
+                  f.write('''
+import os
+import json
+import boto3
+import cfnresponse
+from transformers import AutoTokenizer
+from huggingface_hub import snapshot_download
+from botocore.config import Config
+
+def generate(messages, temperature=0.3, max_tokens=4096, top_p=0.9, continuation=False, max_retries=10):
+    """
+    Generate response using the model with proper tokenization and retry mechanism
+    """
+    tokenizer = AutoTokenizer.from_pretrained("deepseek-ai/DeepSeek-R1-Distill-Llama-8B")
+    prompt = tokenizer.apply_chat_template(messages, tokenize=False, 
+                                       add_generation_prompt=not continuation)
+    
+    client = boto3.client('bedrock-runtime', config=Config(
+        connect_timeout=300,
+        read_timeout=300,
+        retries={'max_attempts': max_retries}
+    ))
+    
+    attempt = 0
+    while attempt < max_retries:
+        try:
+            response = client.invoke_model(
+                modelId=model_id,
+                body=json.dumps({
+                    'prompt': prompt,
+                    'temperature': temperature,
+                    'max_gen_len': max_tokens,
+                    'top_p': top_p
+                }),
+                accept='application/json',
+                contentType='application/json'
+            )
+            
+            result = json.loads(response['body'].read().decode('utf-8'))
+            return result
+            
+        except Exception as e:
+            print(f"Attempt {attempt + 1} failed: {str(e)}")
+            attempt += 1
+            if attempt < max_retries:
+                time.sleep(30)
+    
+    raise Exception("Failed to get response after maximum retries")
+
+def handler(event, context):
+    try:
+        if event['RequestType'] in ['Create', 'Update']:
+            # Download model from HuggingFace
+            os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+            local_dir = "/tmp/model"
+            snapshot_download(
+                repo_id="deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
+                local_dir=local_dir
+            )
+            
+            # Upload to S3
+            s3 = boto3.client('s3')
+            bucket = event['ResourceProperties']['BucketName']
+            prefix = event['ResourceProperties']['S3Prefix']
+            
+            for root, dirs, files in os.walk(local_dir):
+                for file in files:
+                    local_path = os.path.join(root, file)
+                    s3_key = os.path.join(
+                        prefix,
+                        os.path.relpath(local_path, local_dir)
+                    )
+                    s3.upload_file(local_path, bucket, s3_key)
+            
+            # Create Bedrock import job
+            bedrock = boto3.client('bedrock')
+            response = bedrock.create_model_customization_job(
+                jobName=event['ResourceProperties']['JobName'],
+                importedModelName=event['ResourceProperties']['ImportedModelName'],
+                roleArn=event['ResourceProperties']['RoleArn'],
+                modelDataSource={
+                    's3DataSource': {
+                        's3Uri': f"s3://{bucket}/{prefix}/"
+                    }
+                }
+            )
+            
+            cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                'JobArn': response['jobArn']
+            })
+        else:
+            cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+            
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        cfnresponse.send(event, context, cfnresponse.FAILED, {
+            'Error': str(e)
+        })
+''')
+              
+              # Create zip file
+              shutil.make_archive('deployment_package', 'zip', '.')
+              
+              return '/tmp/package/deployment_package.zip'
+          
+          def handler(event, context):
+              try:
+                  if event['RequestType'] in ['Create', 'Update']:
+                      # Create deployment package
+                      package_path = create_deployment_package()
+                      
+                      # Upload to S3
+                      s3 = boto3.client('s3')
+                      bucket = event['ResourceProperties']['BucketName']
+                      s3.upload_file(
+                          package_path,
+                          bucket,
+                          'lambda/model_deployment.zip'
+                      )
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                          'PackageLocation': f"s3://{bucket}/lambda/model_deployment.zip"
+                      })
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {
+                      'Error': str(e)
+                  })
+      Runtime: python3.9
+      Timeout: 900
+      MemorySize: 3008
+      Environment:
+        Variables:
+          POWERTOOLS_SERVICE_NAME: DependencyPackager
+
+  # Lambda execution role for model deployment
   LambdaExecutionRole:
     Type: AWS::IAM::Role
     Properties:
@@ -70,108 +284,33 @@ Resources:
                   - !Sub ${ModelStorageBucket.Arn}/*
               - Effect: Allow
                 Action:
-                  - bedrock:*
+                  - bedrock:CreateModelCustomizationJob
+                  - bedrock:GetModelCustomizationJob
+                  - bedrock:ListModelCustomizationJobs
                 Resource: '*'
 
-  # IAM Role for Bedrock Custom Model Import
-  BedrockCustomModelRole:
-    Type: AWS::IAM::Role
+  # Custom resource to create deployment package
+  PackageCreator:
+    Type: Custom::PackageCreator
     Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: bedrock.amazonaws.com
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: BedrockModelAccess
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - bedrock:*
-                Resource: '*'
-        - PolicyName: BedrockS3Access
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - s3:GetObject
-                  - s3:ListBucket
-                Resource:
-                  - !GetAtt ModelStorageBucket.Arn
-                  - !Sub ${ModelStorageBucket.Arn}/*
+      ServiceToken: !GetAtt DependencyPackager.Arn
+      BucketName: !Ref ModelStorageBucket
 
-  # Lambda function for model download and import
+  # Lambda function for model deployment
   ModelDeploymentFunction:
     Type: AWS::Lambda::Function
+    DependsOn: PackageCreator
     Properties:
-      Handler: index.handler
+      Handler: model_deployment.handler
       Role: !GetAtt LambdaExecutionRole.Arn
       Code:
-        ZipFile: |
-          import os
-          import boto3
-          import cfnresponse
-          from huggingface_hub import snapshot_download
-          
-          def handler(event, context):
-              try:
-                  if event['RequestType'] in ['Create', 'Update']:
-                      # Download model from HuggingFace
-                      os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
-                      local_dir = "/tmp/model"
-                      snapshot_download(
-                          repo_id="deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
-                          local_dir=local_dir
-                      )
-                      
-                      # Upload to S3
-                      s3 = boto3.client('s3')
-                      bucket = event['ResourceProperties']['BucketName']
-                      prefix = event['ResourceProperties']['S3Prefix']
-                      
-                      for root, dirs, files in os.walk(local_dir):
-                          for file in files:
-                              local_path = os.path.join(root, file)
-                              s3_key = os.path.join(
-                                  prefix,
-                                  os.path.relpath(local_path, local_dir)
-                              )
-                              s3.upload_file(local_path, bucket, s3_key)
-                      
-                      # Create Bedrock import job
-                      bedrock = boto3.client('bedrock')
-                      response = bedrock.create_model_import_job(
-                          jobName=event['ResourceProperties']['JobName'],
-                          importedModelName=event['ResourceProperties']['ImportedModelName'],
-                          roleArn=event['ResourceProperties']['RoleArn'],
-                          modelDataSource={
-                              's3DataSource': {
-                                  's3Uri': f"s3://{bucket}/{prefix}/"
-                              }
-                          }
-                      )
-                      
-                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {
-                          'JobArn': response['jobArn']
-                      })
-                  else:
-                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
-                      
-              except Exception as e:
-                  print(f"Error: {str(e)}")
-                  cfnresponse.send(event, context, cfnresponse.FAILED, {
-                      'Error': str(e)
-                  })
+        S3Bucket: !Ref ModelStorageBucket
+        S3Key: lambda/model_deployment.zip
       Runtime: python3.9
       Timeout: 900
       MemorySize: 3008
       Layers:
-        - !Sub arn:aws:lambda:${AWS::Region}:017000801446:layer:AWSLambdaPowertoolsPython:3
+        - !Ref ModelDeploymentLayer
       Environment:
         Variables:
           POWERTOOLS_SERVICE_NAME: ModelDeployment
