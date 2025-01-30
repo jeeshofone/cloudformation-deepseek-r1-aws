@@ -73,6 +73,38 @@ Resources:
                   - bedrock:*
                 Resource: '*'
 
+  # IAM Role for Bedrock Custom Model Import
+  BedrockCustomModelRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BedrockModelAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:*
+                Resource: '*'
+        - PolicyName: BedrockS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ModelStorageBucket.Arn
+                  - !Sub ${ModelStorageBucket.Arn}/*
+
   # Lambda function for model download and import
   ModelDeploymentFunction:
     Type: AWS::Lambda::Function
@@ -143,32 +175,6 @@ Resources:
       Environment:
         Variables:
           POWERTOOLS_SERVICE_NAME: ModelDeployment
-
-  # IAM Role for Bedrock Custom Model Import
-  BedrockCustomModelRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: bedrock.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSBedrockServiceRole
-      Policies:
-        - PolicyName: BedrockS3Access
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - s3:GetObject
-                  - s3:ListBucket
-                Resource:
-                  - !GetAtt ModelStorageBucket.Arn
-                  - !Sub ${ModelStorageBucket.Arn}/*
 
   # Custom resource to trigger model deployment
   ModelDeploymentTrigger:
