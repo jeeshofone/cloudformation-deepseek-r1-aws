@@ -103,7 +103,7 @@ def create_or_update_stack(stack_name, region):
     # First create and upload Lambda package
     package_path = create_deployment_package()
     
-    # Create S3 bucket and upload Lambda package
+    # Initialize AWS clients
     s3 = boto3.client('s3', region_name=region)
     cfn = boto3.client('cloudformation', region_name=region)
     
@@ -112,27 +112,64 @@ def create_or_update_stack(stack_name, region):
         template_body = f.read()
     
     try:
-        # Create stack
-        print(f"Deploying stack {stack_name}...")
+        # Create stack first to get the bucket name
+        print(f"Creating initial stack for S3 bucket...")
         try:
-            cfn.create_stack(
+            response = cfn.create_stack(
                 StackName=stack_name,
                 TemplateBody=template_body,
                 Capabilities=['CAPABILITY_IAM']
             )
             waiter = cfn.get_waiter('stack_create_complete')
         except cfn.exceptions.AlreadyExistsException:
-            print(f"Stack {stack_name} exists, updating...")
+            print(f"Stack {stack_name} exists, getting bucket name...")
+            response = cfn.describe_stacks(StackName=stack_name)
+            for output in response['Stacks'][0]['Outputs']:
+                if output['OutputKey'] == 'ModelStorageBucketName':
+                    bucket_name = output['OutputValue']
+                    break
+        else:
+            # Wait for bucket creation
+            print("Waiting for S3 bucket creation...")
+            waiter.wait(
+                StackName=stack_name,
+                WaiterConfig={'Delay': 5, 'MaxAttempts': 60}
+            )
+            # Get bucket name from outputs
+            response = cfn.describe_stacks(StackName=stack_name)
+            for output in response['Stacks'][0]['Outputs']:
+                if output['OutputKey'] == 'ModelStorageBucketName':
+                    bucket_name = output['OutputValue']
+                    break
+        
+        # Upload Lambda package to S3
+        print(f"Uploading Lambda package to S3 bucket {bucket_name}...")
+        s3.upload_file(
+            str(package_path),
+            bucket_name,
+            'lambda/model_deployment.zip'
+        )
+        
+        # Update stack with Lambda function
+        print(f"Updating stack {stack_name} with Lambda function...")
+        try:
             cfn.update_stack(
                 StackName=stack_name,
                 TemplateBody=template_body,
                 Capabilities=['CAPABILITY_IAM']
             )
             waiter = cfn.get_waiter('stack_update_complete')
-        
-        print("Waiting for stack deployment to complete...")
-        waiter.wait(StackName=stack_name)
-        print("Stack deployment completed successfully!")
+            print("Waiting for stack update to complete...")
+            waiter.wait(
+                StackName=stack_name,
+                WaiterConfig={'Delay': 5, 'MaxAttempts': 60}
+            )
+            print("Stack deployment completed successfully!")
+        except cfn.exceptions.ClientError as e:
+            if 'No updates are to be performed' in str(e):
+                print("No updates needed for the stack.")
+            else:
+                raise
         
     except Exception as e:
         print(f"Error deploying stack: {str(e)}")
