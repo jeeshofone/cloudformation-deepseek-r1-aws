@@ -1,0 +1,195 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  CloudFormation template to deploy DeepSeek-R1-Distill-Llama-8B model to Amazon Bedrock.
+  This template creates necessary IAM roles, S3 bucket, and Lambda functions for automated deployment.
+
+Parameters:
+  ModelName:
+    Type: String
+    Default: DeepSeek-R1-Distill-Llama-8B
+    Description: Name of the DeepSeek model to be imported
+  
+  ImportedModelName:
+    Type: String
+    Default: deepseek-8b-model
+    Description: Name for the imported model in Bedrock
+    
+  JobName:
+    Type: String
+    Default: deepseek-8b-import-job
+    Description: Name for the model import job
+
+  S3BucketPrefix:
+    Type: String
+    Default: DeepSeek-R1-Distill-Llama-8B
+    Description: Prefix for S3 objects storing the model files
+
+Resources:
+  # S3 Bucket for model storage
+  ModelStorageBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+  # Lambda execution role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ModelDownloadAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ModelStorageBucket.Arn
+                  - !Sub ${ModelStorageBucket.Arn}/*
+              - Effect: Allow
+                Action:
+                  - bedrock:*
+                Resource: '*'
+
+  # Lambda function for model download and import
+  ModelDeploymentFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import os
+          import boto3
+          import cfnresponse
+          from huggingface_hub import snapshot_download
+          
+          def handler(event, context):
+              try:
+                  if event['RequestType'] in ['Create', 'Update']:
+                      # Download model from HuggingFace
+                      os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+                      local_dir = "/tmp/model"
+                      snapshot_download(
+                          repo_id="deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
+                          local_dir=local_dir
+                      )
+                      
+                      # Upload to S3
+                      s3 = boto3.client('s3')
+                      bucket = event['ResourceProperties']['BucketName']
+                      prefix = event['ResourceProperties']['S3Prefix']
+                      
+                      for root, dirs, files in os.walk(local_dir):
+                          for file in files:
+                              local_path = os.path.join(root, file)
+                              s3_key = os.path.join(
+                                  prefix,
+                                  os.path.relpath(local_path, local_dir)
+                              )
+                              s3.upload_file(local_path, bucket, s3_key)
+                      
+                      # Create Bedrock import job
+                      bedrock = boto3.client('bedrock')
+                      response = bedrock.create_model_import_job(
+                          jobName=event['ResourceProperties']['JobName'],
+                          importedModelName=event['ResourceProperties']['ImportedModelName'],
+                          roleArn=event['ResourceProperties']['RoleArn'],
+                          modelDataSource={
+                              's3DataSource': {
+                                  's3Uri': f"s3://{bucket}/{prefix}/"
+                              }
+                          }
+                      )
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                          'JobArn': response['jobArn']
+                      })
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {
+                      'Error': str(e)
+                  })
+      Runtime: python3.9
+      Timeout: 900
+      MemorySize: 3008
+      Layers:
+        - !Sub arn:aws:lambda:${AWS::Region}:017000801446:layer:AWSLambdaPowertoolsPython:3
+      Environment:
+        Variables:
+          POWERTOOLS_SERVICE_NAME: ModelDeployment
+
+  # IAM Role for Bedrock Custom Model Import
+  BedrockCustomModelRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSBedrockServiceRole
+      Policies:
+        - PolicyName: BedrockS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ModelStorageBucket.Arn
+                  - !Sub ${ModelStorageBucket.Arn}/*
+
+  # Custom resource to trigger model deployment
+  ModelDeploymentTrigger:
+    Type: Custom::ModelDeployment
+    Properties:
+      ServiceToken: !GetAtt ModelDeploymentFunction.Arn
+      BucketName: !Ref ModelStorageBucket
+      S3Prefix: !Ref S3BucketPrefix
+      JobName: !Ref JobName
+      ImportedModelName: !Ref ImportedModelName
+      RoleArn: !GetAtt BedrockCustomModelRole.Arn
+
+Outputs:
+  ModelStorageBucketName:
+    Description: Name of the S3 bucket storing model files
+    Value: !Ref ModelStorageBucket
+
+  BedrockCustomModelRoleArn:
+    Description: ARN of IAM role for Bedrock Custom Model Import
+    Value: !GetAtt BedrockCustomModelRole.Arn
+
+  ModelImportJobArn:
+    Description: ARN of the Bedrock Model Import Job
+    Value: !GetAtt ModelDeploymentTrigger.JobArn 
