@@ -4,104 +4,150 @@ DeepSeek Bedrock Model Deployment Script
 This script handles CloudFormation stack deployment for the DeepSeek Bedrock model
 """
 
+import os
 import boto3
 import argparse
-import sys
-import json
+import tempfile
+import subprocess
+import shutil
+from pathlib import Path
 from botocore.exceptions import ClientError
 
-def deploy_stack(stack_name, template_file, profile_name=None, region='us-west-2'):
-    """
-    Deploy CloudFormation stack for DeepSeek model
+def create_deployment_package():
+    """Create Lambda deployment package with all required dependencies"""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        # Create requirements.txt
+        requirements = '''
+        transformers
+        huggingface-hub[hf_transfer]
+        boto3
+        cfnresponse
+        '''.strip()
+        
+        req_file = Path(tmp_dir) / 'requirements.txt'
+        req_file.write_text(requirements)
+        
+        # Install dependencies
+        subprocess.check_call([
+            'pip', 'install',
+            '-r', str(req_file),
+            '--target', tmp_dir
+        ])
+        
+        # Write Lambda handler code
+        handler_code = '''
+import os
+import json
+import boto3
+import cfnresponse
+from transformers import AutoTokenizer
+from huggingface_hub import snapshot_download
+from botocore.config import Config
+
+def handler(event, context):
+    try:
+        if event['RequestType'] in ['Create', 'Update']:
+            os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+            local_dir = "/tmp/model"
+            snapshot_download(
+                repo_id="deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
+                local_dir=local_dir
+            )
+            
+            s3 = boto3.client('s3')
+            bucket = event['ResourceProperties']['BucketName']
+            prefix = event['ResourceProperties']['S3Prefix']
+            
+            for root, dirs, files in os.walk(local_dir):
+                for file in files:
+                    local_path = os.path.join(root, file)
+                    s3_key = os.path.join(
+                        prefix,
+                        os.path.relpath(local_path, local_dir)
+                    )
+                    s3.upload_file(local_path, bucket, s3_key)
+            
+            bedrock = boto3.client('bedrock')
+            response = bedrock.create_model_customization_job(
+                jobName=event['ResourceProperties']['JobName'],
+                importedModelName=event['ResourceProperties']['ImportedModelName'],
+                roleArn=event['ResourceProperties']['RoleArn'],
+                modelDataSource={
+                    's3DataSource': {
+                        's3Uri': f"s3://{bucket}/{prefix}/"
+                    }
+                }
+            )
+            
+            cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                'JobArn': response['jobArn']
+            })
+        else:
+            cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        cfnresponse.send(event, context, cfnresponse.FAILED, {
+            'Error': str(e)
+        })
+        '''.strip()
+        
+        handler_file = Path(tmp_dir) / 'model_deployment.py'
+        handler_file.write_text(handler_code)
+        
+        # Create zip file
+        shutil.make_archive('deployment_package', 'zip', tmp_dir)
+        return Path('deployment_package.zip')
+
+def create_or_update_stack(stack_name, region):
+    """Create or update CloudFormation stack"""
+    # First create and upload Lambda package
+    package_path = create_deployment_package()
     
-    Args:
-        stack_name (str): Name of the CloudFormation stack
-        template_file (str): Path to CloudFormation template
-        profile_name (str): AWS profile name to use
-        region (str): AWS region to deploy to
-    """
-    session = boto3.Session(profile_name=profile_name, region_name=region)
-    cf = session.client('cloudformation')
+    # Create S3 bucket and upload Lambda package
+    s3 = boto3.client('s3', region_name=region)
+    cfn = boto3.client('cloudformation', region_name=region)
+    
+    # Get template from file
+    with open('deepseek-bedrock-stack.yaml', 'r') as f:
+        template_body = f.read()
     
     try:
-        # Read template
-        with open(template_file, 'r') as f:
-            template_body = f.read()
-        
-        # Deploy stack
+        # Create stack
         print(f"Deploying stack {stack_name}...")
-        cf.create_stack(
-            StackName=stack_name,
-            TemplateBody=template_body,
-            Capabilities=['CAPABILITY_IAM']
-        )
+        try:
+            cfn.create_stack(
+                StackName=stack_name,
+                TemplateBody=template_body,
+                Capabilities=['CAPABILITY_IAM']
+            )
+            waiter = cfn.get_waiter('stack_create_complete')
+        except cfn.exceptions.AlreadyExistsException:
+            print(f"Stack {stack_name} exists, updating...")
+            cfn.update_stack(
+                StackName=stack_name,
+                TemplateBody=template_body,
+                Capabilities=['CAPABILITY_IAM']
+            )
+            waiter = cfn.get_waiter('stack_update_complete')
         
-        # Wait for completion
-        print("Waiting for stack creation to complete...")
-        waiter = cf.get_waiter('stack_create_complete')
-        waiter.wait(
-            StackName=stack_name,
-            WaiterConfig={'Delay': 30, 'MaxAttempts': 60}
-        )
+        print("Waiting for stack deployment to complete...")
+        waiter.wait(StackName=stack_name)
+        print("Stack deployment completed successfully!")
         
-        # Get outputs
-        response = cf.describe_stacks(StackName=stack_name)
-        outputs = {
-            output['OutputKey']: output['OutputValue'] 
-            for output in response['Stacks'][0]['Outputs']
-        }
-        
-        print("\nStack deployment complete!")
-        print("\nStack Outputs:")
-        print(json.dumps(outputs, indent=2))
-        
-        return outputs
-        
-    except ClientError as e:
-        if e.response['Error']['Code'] == 'AlreadyExistsException':
-            print(f"Stack {stack_name} already exists. Updating...")
-            try:
-                cf.update_stack(
-                    StackName=stack_name,
-                    TemplateBody=template_body,
-                    Capabilities=['CAPABILITY_IAM']
-                )
-                waiter = cf.get_waiter('stack_update_complete')
-                waiter.wait(
-                    StackName=stack_name,
-                    WaiterConfig={'Delay': 30, 'MaxAttempts': 60}
-                )
-                print("Stack update complete!")
-            except ClientError as update_error:
-                if 'No updates are to be performed' in str(update_error):
-                    print("No updates needed for the stack.")
-                else:
-                    raise update_error
-        else:
-            raise e
+    except Exception as e:
+        print(f"Error deploying stack: {str(e)}")
+        raise
+    finally:
+        # Cleanup
+        package_path.unlink(missing_ok=True)
 
 def main():
     parser = argparse.ArgumentParser(description='Deploy DeepSeek model to AWS Bedrock')
-    parser.add_argument('--stack-name', default='deepseek-bedrock-stack',
-                      help='Name of the CloudFormation stack')
-    parser.add_argument('--template', default='deepseek-bedrock-stack.yaml',
-                      help='Path to CloudFormation template')
-    parser.add_argument('--profile', help='AWS profile name to use')
-    parser.add_argument('--region', default='us-west-2',
-                      help='AWS region to deploy to')
+    parser.add_argument('--stack-name', required=True, help='Name of the CloudFormation stack')
+    parser.add_argument('--region', required=True, help='AWS region to deploy to')
     
     args = parser.parse_args()
-    
-    try:
-        deploy_stack(
-            args.stack_name,
-            args.template,
-            args.profile,
-            args.region
-        )
-    except Exception as e:
-        print(f"Error: {str(e)}", file=sys.stderr)
-        sys.exit(1)
+    create_or_update_stack(args.stack_name, args.region)
 
 if __name__ == '__main__':
     main() 

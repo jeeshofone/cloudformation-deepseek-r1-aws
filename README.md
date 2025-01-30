@@ -2,6 +2,18 @@
 
 This project provides an automated deployment solution for importing DeepSeek's distilled Llama models to Amazon Bedrock using AWS native services. The deployment is handled entirely through AWS services, eliminating the need for local compute resources.
 
+## NOTE THIS IS A WORK IN PROGRESS
+If you are looking for a working solution, please use the [DeepSeek Bedrock Model Deployment](https://github.com/aws-samples/amazon-bedrock-samples/blob/main/custom-models/import_models/llama-3/DeepSeek-R1-Distill-Llama-Noteb.ipynb) project.
+
+# Goal
+
+The goal of this project is to create a CloudFormation template that will deploy a Lambda function that will download the DeepSeek-R1-Distill-Llama-8B and 70B models from HuggingFace and import them into Bedrock. This will allow you to use the models in your own applications without having to worry about the underlying infrastructure. 
+
+The core difference between this project and [DeepSeek Bedrock Model Deployment](https://github.com/aws-samples/amazon-bedrock-samples/blob/main/custom-models/import_models/llama-3/DeepSeek-R1-Distill-Llama-Noteb.ipynb) is the reuseability of the deployment pipeline and the reduced requirements on the local user device for deployment(downloading the model files locally is not required) 
+
+This project is heavily inspired by the [DeepSeek Bedrock Model Deployment](https://github.com/aws-samples/amazon-bedrock-samples/blob/main/custom-models/import_models/llama-3/DeepSeek-R1-Distill-Llama-Noteb.ipynb) project.
+
+
 ## Features
 
 - Serverless deployment using AWS Lambda and CloudFormation
