@@ -96,30 +96,16 @@ Resources:
           import cfnresponse
           
           def create_deployment_package():
-              # Create temp directory
               os.makedirs('/tmp/package', exist_ok=True)
               os.chdir('/tmp/package')
               
-              # Create requirements.txt
               with open('requirements.txt', 'w') as f:
-                  f.write('\n'.join([
-                      'transformers',
-                      'huggingface-hub[hf_transfer]',
-                      'boto3',
-                      'cfnresponse'
-                  ]))
+                  f.write('transformers\nhuggingface-hub[hf_transfer]\nboto3\ncfnresponse\n')
               
-              # Install dependencies
-              subprocess.check_call([
-                  'pip', 'install',
-                  '-r', 'requirements.txt',
-                  '--target', '.'
-              ])
+              subprocess.check_call(['pip', 'install', '-r', 'requirements.txt', '--target', '.'])
               
-              # Create deployment code
               with open('model_deployment.py', 'w') as f:
-                  f.write('''
-import os
+                  f.write('''import os
 import json
 import boto3
 import cfnresponse
@@ -128,12 +114,8 @@ from huggingface_hub import snapshot_download
 from botocore.config import Config
 
 def generate(messages, temperature=0.3, max_tokens=4096, top_p=0.9, continuation=False, max_retries=10):
-    """
-    Generate response using the model with proper tokenization and retry mechanism
-    """
     tokenizer = AutoTokenizer.from_pretrained("deepseek-ai/DeepSeek-R1-Distill-Llama-8B")
-    prompt = tokenizer.apply_chat_template(messages, tokenize=False, 
-                                       add_generation_prompt=not continuation)
+    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=not continuation)
     
     client = boto3.client('bedrock-runtime', config=Config(
         connect_timeout=300,
@@ -155,22 +137,18 @@ def generate(messages, temperature=0.3, max_tokens=4096, top_p=0.9, continuation
                 accept='application/json',
                 contentType='application/json'
             )
-            
             result = json.loads(response['body'].read().decode('utf-8'))
             return result
-            
         except Exception as e:
             print(f"Attempt {attempt + 1} failed: {str(e)}")
             attempt += 1
             if attempt < max_retries:
                 time.sleep(30)
-    
     raise Exception("Failed to get response after maximum retries")
 
 def handler(event, context):
     try:
         if event['RequestType'] in ['Create', 'Update']:
-            # Download model from HuggingFace
             os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
             local_dir = "/tmp/model"
             snapshot_download(
@@ -178,7 +156,6 @@ def handler(event, context):
                 local_dir=local_dir
             )
             
-            # Upload to S3
             s3 = boto3.client('s3')
             bucket = event['ResourceProperties']['BucketName']
             prefix = event['ResourceProperties']['S3Prefix']
@@ -192,7 +169,6 @@ def handler(event, context):
                     )
                     s3.upload_file(local_path, bucket, s3_key)
             
-            # Create Bedrock import job
             bedrock = boto3.client('bedrock')
             response = bedrock.create_model_customization_job(
                 jobName=event['ResourceProperties']['JobName'],
@@ -210,7 +186,6 @@ def handler(event, context):
             })
         else:
             cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
-            
     except Exception as e:
         print(f"Error: {str(e)}")
         cfnresponse.send(event, context, cfnresponse.FAILED, {
@@ -218,18 +193,14 @@ def handler(event, context):
         })
 ''')
               
-              # Create zip file
               shutil.make_archive('deployment_package', 'zip', '.')
-              
               return '/tmp/package/deployment_package.zip'
           
           def handler(event, context):
               try:
                   if event['RequestType'] in ['Create', 'Update']:
-                      # Create deployment package
                       package_path = create_deployment_package()
                       
-                      # Upload to S3
                       s3 = boto3.client('s3')
                       bucket = event['ResourceProperties']['BucketName']
                       s3.upload_file(
@@ -243,7 +214,6 @@ def handler(event, context):
                       })
                   else:
                       cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
-                      
               except Exception as e:
                   print(f"Error: {str(e)}")
                   cfnresponse.send(event, context, cfnresponse.FAILED, {
